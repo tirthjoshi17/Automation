@@ -1,0 +1,66 @@
+- name: Fetch VM CPU pinning details and save to CSV
+  hosts: Sriov
+  gather_facts: true  
+  tasks:
+    - name: Fetch VM names on each compute node
+      command: sudo virsh list --name --all
+      register: vm_names
+
+    - name: Fetch CPU pinning details for each VM
+      shell: |
+        vm_name={{ item }}
+        if [[ -z "$vm_name" ]]; then
+            exit 0
+        fi
+
+        xml=$(sudo virsh dumpxml "$vm_name" 2>/dev/null)
+        if [[ -z "$xml" ]]; then
+            echo "{{ ansible_hostname }},${vm_name},,,"
+            exit 0
+        fi
+
+        vcpupin_details=$(echo "$xml" | grep -oP "<vcpupin vcpu='[0-9]+' cpuset='[^']+'" | sed -E "s/<vcpupin vcpu='([0-9]+)' cpuset='([^']+)'/\\1:\\2/")
+        cpuset_emulatorpin=$(echo "$xml" | grep -oP "(?<=<emulatorpin cpuset=')[^']*(?=')")
+        cpuset_emulatorpin=${cpuset_emulatorpin:-"Not Found"}
+
+        vcpus=""
+        cpus=""
+        if [[ -n "$vcpupin_details" ]]; then
+            vcpus=$(echo "$vcpupin_details" | cut -d':' -f1 | paste -sd, -)
+            cpus=$(echo "$vcpupin_details" | cut -d':' -f2 | paste -sd, -)
+        fi
+
+        # Format the details into a single string for CPU Details column with quotes around the value
+        # cpu_details="VCPU: ${vcpus} CPU: ${cpus} Emulatorpin: ${cpuset_emulatorpin}"
+
+        # Output the formatted details as a single row for each VM
+        echo "{{ ansible_hostname }},${vm_name},\"${vcpus}\",\"${cpus}\",\"${cpuset_emulatorpin}\""
+       # echo "{{ ansible_hostname }},${vm_name},\"${cpu_details}\""
+      loop: "{{ vm_names.stdout_lines }}"
+      register: vm_results
+
+
+    - name: Set CSV content
+      set_fact:
+        csv_content: |
+          "Compute","Instance","vCPU","CPU","Emulatorpin"
+          {% for host in groups['Sriov'] %}
+          {% if hostvars[host].vm_results is defined %}
+          {% for vm in hostvars[host].vm_results.results %}
+          {{ vm.stdout}}
+          {% endfor %}
+          {% endif %}
+          {% endfor %}
+
+    - name: Save VM details to local CSV
+      delegate_to: localhost
+      run_once: true
+      copy:
+        content: "{{ csv_content }}"
+        dest: /tmp/vm_cpu_pinning.csv
+
+    - name: Display CSV file location
+      delegate_to: localhost
+      run_once: true
+      debug:
+        msg: "The CSV file has been saved to /tmp/vm_cpu_pinning.csv"

@@ -1,0 +1,128 @@
+- name: Gather host details and create CSV
+  hosts: Compute, Control, hypervisor, CephStorage
+  gather_facts: no
+  become: true
+  strategy: linear
+
+  vars:
+    csv_file: "/home/stack/hosts_and_vms.csv"
+    skipped_hosts_file: "skipped_hosts.log"
+    debug_log_file: "debug_host_data.log"
+
+  tasks:
+    - name: Generate the CSV header
+      copy:
+        content: "IPMI IP,Serial Number,Hostname,VM\n"
+        dest: "{{ csv_file }}"
+      delegate_to: localhost
+
+    - name: Retrieve IPMI IP, Serial Number, and VM names
+      shell: |
+        SERIAL_NUMBER=$(sudo dmidecode -s system-serial-number || echo "UNKNOWN")
+        IPMI_IP=$(sudo ipmitool lan print | grep 'IP Address  ' | awk '{print $4}' || echo "UNKNOWN")
+
+        vm_names=""
+
+        while read -r vm_name; do
+          [[ -z "$vm_name" ]] && continue
+
+          vm_xml=$(sudo virsh dumpxml "$vm_name")
+          vm_name_from_xml=$(echo "$vm_xml" | grep -oP '(?<=<nova:name>).*?(?=</nova:name>)')
+
+          [[ -z "$vm_name_from_xml" ]] && vm_name_from_xml="$vm_name"
+
+          vm_names+="$vm_name_from_xml "
+        done < <(sudo virsh list --name)
+        set -o pipefail
+        vm_names=$(printf "%s\n" "$vm_names" | sed '/^$/d')
+        #vm_names=$(printf "%s\n" "$vm_names" | sed '/^$/d')
+        echo "$IPMI_IP,$SERIAL_NUMBER,{{ inventory_hostname }},\"$vm_names\""
+      args:
+        executable: /bin/bash
+      register: host_details
+      changed_when: false
+
+    - name: Debug command output
+      debug:
+        msg: "Host: {{ inventory_hostname }} | Output: {{ host_details.stdout }}"
+      delegate_to: localhost
+
+    - name: Log skipped hosts with details
+      shell: |
+        echo "Host {{ inventory_hostname }} failed with output: {{ host_details.stdout }}" >> {{ skipped_hosts_file }}
+      when: host_details.stdout == ""
+
+    - name: Append host details to CSV
+      shell: echo "{{ host_details.stdout | default('UNKNOWN,UNKNOWN,UNKNOWN') }}" >> "{{ csv_file }}"
+      delegate_to: localhost
+
+    - name: Print contents of the final CSV file
+      command: cat "{{ csv_file }}"
+      register: final_csv
+      delegate_to: localhost
+
+    - name: Debugging Print contents of the final CSV file
+      debug:
+        msg: "Final CSV file contents:\n{{ final_csv.stdout }}"
+
+    - name: Print skipped hosts log
+      command: cat "{{ skipped_hosts_file }}"
+      delegate_to: localhost
+      ignore_errors: yes
+      register: skipped_hosts
+
+    - name: Debug skipped hosts log
+      debug:
+        msg: "Skipped hosts log:\n{{ skipped_hosts.stdout }}"
+      when: skipped_hosts is defined
+
+    - name: Create the shell script on the remote host
+      ansible.builtin.copy:
+        dest: "/tmp/process_csv.sh"
+        content: |
+          #!/bin/bash
+          # Input and output file names
+          input_file="{{ csv_file }}"
+          output_file="/tmp/output.csv"
+
+          awk -F, 'BEGIN {OFS=","} {
+              if (NR > 0) {
+                  gsub(/ /, "\n", $4)
+                  $4 = "\"" $4 "\""
+              }
+              print
+          }' "$input_file" > "$output_file"
+
+          echo "Modified CSV saved to $output_file"
+        mode: '0755'
+      delegate_to: localhost
+
+    - name: Execute the shell script
+      shell: |
+        sh /tmp/process_csv.sh
+      #ansible.builtin.shell: "/tmp/process_csv.sh"
+      register: result
+      delegate_to: localhost
+
+    - name: Display the result
+      ansible.builtin.debug:
+        var: result.stdout
+      delegate_to: localhost
+
+    - name: Move the output file to the original input file location
+      shell: |
+        cp "/tmp/output.csv" "/home/stack/hosts_and_vms.csv"
+      when: result.rc == 0
+      notify:
+        - Clean up temporary files
+      delegate_to: localhost
+
+  handlers:
+    - name: Clean up temporary files
+      ansible.builtin.file:
+        path: "/tmp/process_csv.sh"
+        state: absent
+    - name: Clean up temporary files
+      ansible.builtin.file:
+        path: "/tmp/output.csv"
+        state: absent
